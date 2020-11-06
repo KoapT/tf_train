@@ -1,0 +1,57 @@
+{	
+	"model_name": "Object_detection",
+	"yolo_version": "v4",
+
+	"model_config": {
+		"input_size": 544,
+		"batch_norm_params": {
+			"decay": 0.9997000098228455,
+			"epsilon": 0.0010000000474974513,
+			"scale": true,
+			"center": true
+		},
+ 		"debug": false,
+		"anchors_v3":[10,13, 16,30, 33,23,
+			30,61, 62,45, 59,119,
+			116,90,  156,198,  373,326],
+		"anchors_v4": [12, 16, 19, 36, 40, 28,
+			36, 75, 76, 55, 72, 146,
+			142, 110, 192, 243, 459, 401],
+		"anchor_per_scale": 3,
+		"strides": [8,16,32]
+	},
+
+	"sample_config": {
+		"max_num_objects_per_image": 100,
+		"key_name": "display_name",
+		"build_label_from_name": true
+	},
+
+	"train_config": {
+		"batch_size": 32,
+		"learning_policy": "step",
+		"base_learning_rate": 0.00000000001,
+		"learning_rate_decay_step": 300000,
+		"learning_rate_decay_factor": 0.2,
+		"learning_power": 1.0,
+		"slow_start_step": 2000,
+		"slow_start_learning_rate": 0.000001,
+		"end_learning_rate": 0.0000001,
+		"momentum": 0.95,
+		"rmsprop_decay": 0.95,
+		"rmsprop_momentum": 0.0001,
+		"opt_epsilon": 1e-10,
+		"visualize_images": true,
+		"max_num_images_to_visualize": 4,
+		"weights_regularizer": 0.0,
+		"num_threads": 20
+	},
+
+	"eval_config": {
+		"batch_size": 32
+	},
+
+	"export_config": {
+		"export_as_train_mode": false
+	}
+}

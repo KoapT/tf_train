@@ -1,0 +1,315 @@
+#! /usr/bin/env python
+# -*- coding: utf-8 -*-
+# ================================================================
+#   Editor      : PyCharm
+#   File name   : object_detection.py
+#   Author      : Koap
+#   Created date: 2020/3/11 下午3:44
+#   Description :
+#
+# ================================================================
+
+import tensorflow as tf
+import numpy as np
+from deepin.src.utils import param_file_access
+import deepin.src.datasets.std.inputs_builder as std_inputs_builder
+from deepin.src.core import model
+from deepin.src.utils import model_utils
+from deepin.src.utils import visualization_utils
+from deepin.src.preprocess import inception_preprocessing
+from deepin.src.nets import yolo_v3
+import tensorflow.contrib.slim as slim
+
+_NAME_INPUT_IMAGE = 'input_image'
+_NAME_OUTPUT_LOGIT = 'output_label'
+_SCOPE_PREDICT_LOGIT = 'deepin-v3/detect_'
+
+
+def _test(sess):
+    print('enter test=================')
+
+
+net = yolo_v3.YOLOV3
+
+
+class ObjectDetection(model.Model):
+    def initialize(self, model_info_path, sample_info_path, is_training):
+        self._label_map_path = sample_info_path
+        self._config_path = model_info_path
+        self._class_list = param_file_access.get_json_params(self._label_map_path)
+        self._class_dict = param_file_access.get_label_map_class_id_name_dict(self._label_map_path)  # Yolo的标签从0开始
+        self._category_index = param_file_access.get_category_index(self._label_map_path)
+        self._num_classes = len(self._class_dict)
+        self._is_training = is_training
+        self._config_dict = param_file_access.get_json_params(self._config_path)
+        self._batch_size = (self._config_dict['train_config']['batch_size']
+                            if is_training
+                            else self._config_dict['eval_config']['batch_size'])
+        self._input_size = self._config_dict['model_config']['input_size']
+        self._max_num_objects_per_image = self._config_dict['sample_config']['max_num_objects_per_image']
+        self._label_name_key = self._config_dict['sample_config']['key_name']
+        self._build_label_from_name = self._config_dict['sample_config']['build_label_from_name']
+        self._batch_norm_params = self._config_dict['model_config']['batch_norm_params']
+        self._is_debug = self._config_dict['model_config']['debug']
+        print('Debug: {}'.format(self._is_debug))
+        # TODO: add the following items to the config file：
+        _anchors = self._config_dict['model_config']['anchors']  # scale 之后的anchor
+        self._anchor_per_scale = self._config_dict['model_config']['anchor_per_scale']
+        self._strides = np.array(self._config_dict['model_config']['strides'])
+        self._anchors = np.array(_anchors, dtype=np.float32).reshape([-1, self._anchor_per_scale, 2]) \
+                        / self._strides[:, None, None]
+        self._visualize_images = self._config_dict['train_config']['visualize_images']
+        self._max_num_images_visualized = self._config_dict['train_config']['max_num_images_to_visualize']
+        self._weights_decay = self._config_dict['train_config']['weights_regularizer']
+        self._num_threads = self._config_dict['train_config']['num_threads']  # 数据预处理的线程数
+
+    def preprocess(self, image, bboxes, fast_mode=True):
+        with tf.name_scope('preprocess_image'):
+            image = tf.image.convert_image_dtype(image, dtype=tf.float32)
+            num_distort_cases = 1 if fast_mode else 4
+            image = inception_preprocessing.apply_with_random_selector(
+                image,
+                lambda x, ordering: inception_preprocessing.distort_color(x, ordering, fast_mode),
+                num_cases=num_distort_cases)
+
+            image, bboxes = tf.cond(tf.random_uniform([]) > 0.5,
+                                    lambda: inception_preprocessing.random_crop(image, bboxes),
+                                    lambda: inception_preprocessing.do_nothing(image, bboxes))
+            image, bboxes = tf.cond(tf.random_uniform([]) > 0.5,
+                                    lambda: inception_preprocessing.do_nothing(image, bboxes),
+                                    lambda: inception_preprocessing.random_pad_image(image, bboxes))
+            image = tf.image.resize_images(
+                image, [self._input_size, self._input_size],
+                method=tf.image.ResizeMethod.BILINEAR,
+                align_corners=True)
+            return image, bboxes
+
+    def predict(self, preprocessed_inputs):
+        detections = net(preprocessed_inputs,
+                         num_classes=self._num_classes,
+                         batch_norm_params=self._batch_norm_params,
+                         activation_fn=tf.nn.leaky_relu,
+                         weight_decay=self._weights_decay,
+                         is_training=self._is_training)
+        return detections
+
+    def loss(self, pred, label, bboxes_xywh):
+        loss = yolo_v3.loss_layer(pred, label, bboxes_xywh,input_size=self._input_size)
+        regularization_loss = tf.add_n(tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES))
+        losses = [loss,regularization_loss]
+        return losses
+
+    def postprocess(self, detections):
+        with tf.name_scope('postprocess'):
+            predictions_s = yolo_v3.decode(detections['detect_s'], self._anchors[0],
+                                                    self._num_classes, self._strides[0])
+            predictions_m = yolo_v3.decode(detections['detect_m'], self._anchors[1],
+                                                    self._num_classes, self._strides[1])
+            predictions_l = yolo_v3.decode(detections['detect_l'], self._anchors[2],
+                                                    self._num_classes, self._strides[2])
+            predictions = tf.concat([predictions_s, predictions_m, predictions_l], axis=1)
+            return predictions
+
+    def provide_groundtruth(self, bboxes_xywh, labels, num_objs, img_size, strides, anchors,
+                            anchor_per_scale, num_classes, max_num_objects):
+        with tf.name_scope('process_bboxe_to_provided_groundtruths'):
+            provided_groundtruths = yolo_v3.preprocess_true_boxes_pyfunc(bboxes_xywh, labels, num_objs,
+                                                                                  img_size,
+                                                                                  strides, anchors,
+                                                                                  anchor_per_scale, num_classes,
+                                                                                  max_num_objects)
+            return provided_groundtruths
+
+    def boxes_yxyx2xywh(self, boxes):
+        y1, x1, y2, x2 = tf.split(boxes, [1, 1, 1, 1], axis=-1)
+        boxes_xyxy = tf.concat([x1, y1, x2, y2], axis=-1)
+        boxes_xywh = tf.concat(
+            [(boxes_xyxy[..., 2:] + boxes_xyxy[..., :2]) * 0.5, boxes_xyxy[..., 2:] - boxes_xyxy[..., :2]], axis=-1)
+        return boxes_xywh
+
+    def build_inputs(self, sample_path, num_samples, batch_size, num_clones):
+        builder = std_inputs_builder.StdTFRecordInputs()
+
+        def _build_name_to_label_map(label_map_path, label_name_key):
+            name_list = param_file_access.get_label_map_value_list_by_key(label_map_path, key=label_name_key)
+            id_list = [i for i in range(0, len(name_list))]
+            name_list_tensor = tf.constant(name_list)
+            id_list_tensor = tf.constant(id_list, dtype=tf.int64)
+            return model_utils.build_tensor_map(
+                key_list_tensor=name_list_tensor,
+                value_list_tensor=id_list_tensor,
+                default_value=-1)
+
+        def preprocess_fn(sample):
+            if self._build_label_from_name:
+                tensor_map = _build_name_to_label_map(self._label_map_path, self._label_name_key)
+                sample[std_inputs_builder.OBJ_LABEL] = model_utils.mapping_tensor(
+                    sample[std_inputs_builder.OBJ_LABEL_NAME], tensor_map)
+            image = sample[std_inputs_builder.IMAGE]
+            num_objs = sample[std_inputs_builder.NUM_OBJS]
+            bboxes = sample[std_inputs_builder.OBJ_BOX]
+            labels = sample[std_inputs_builder.OBJ_LABEL]
+            preprocessed_image, preprocessed_bboxes = self.preprocess(image, bboxes)
+            preprocessed_bboxes = preprocessed_bboxes * self._input_size  # change to realsize
+            boxes_xywh = self.boxes_yxyx2xywh(preprocessed_bboxes)
+            provided_groundtruths = self.provide_groundtruth(boxes_xywh, labels, num_objs,
+                                                             self._input_size,
+                                                             strides=self._strides,
+                                                             anchors=self._anchors,
+                                                             anchor_per_scale=self._anchor_per_scale,
+                                                             num_classes=self._num_classes,
+                                                             max_num_objects=self._max_num_objects_per_image)
+
+            sample[std_inputs_builder.IMAGE] = preprocessed_image
+            sample[std_inputs_builder.OBJ_BOX] = preprocessed_bboxes
+            sample['boxes_xywh'] = boxes_xywh
+            sample['logits'] = provided_groundtruths
+            return sample
+
+        input_queue = builder.get(
+            tfrecord_path=sample_path,
+            num_samples=num_samples,
+            batch_size=batch_size,
+            preprocess_fn=preprocess_fn,
+            num_clones=num_clones,
+            num_threads=self._num_threads,
+            include_detect=True,
+            max_num_labels=self._num_classes,
+            max_num_objects=self._max_num_objects_per_image)
+        return input_queue
+
+    def build_model(self, input_queue):
+        samples = input_queue.dequeue()
+        image_names = samples[std_inputs_builder.NAME]
+        preprocessed_inputs = samples[std_inputs_builder.IMAGE]
+        preprocessed_inputs = tf.check_numerics(preprocessed_inputs, 'preprocessed_inputs is inf or nan.')
+        gt_boxes = samples[std_inputs_builder.OBJ_BOX]
+        provided_groundtruths = samples['logits']
+        bboxes_xywh = samples['boxes_xywh']
+        predictions = self.predict(preprocessed_inputs)
+        postprocessed_predictions = self.postprocess(predictions)
+        losses = self.loss(postprocessed_predictions, provided_groundtruths, bboxes_xywh)
+        loss = tf.add_n(losses)
+
+        tf.summary.scalar('Loss/loss', losses[0])
+        tf.summary.scalar('Loss/regularization_loss', losses[1])
+
+        preprocessed_inputs = tf.identity(preprocessed_inputs, name='preprocessed_inputs')
+        provided_groundtruths = tf.identity(provided_groundtruths, name='provided_groundtruths')
+        postprocessed_predictions = tf.identity(postprocessed_predictions, name='postprocessed_predictions')
+
+        # evaluation metrics
+        metric_map = {}
+
+        # visualize gt
+        if self._visualize_images:
+            images = samples[std_inputs_builder.IMAGE]
+            images_uint8 = tf.image.convert_image_dtype(images, dtype=tf.uint8)
+            bboxes = samples[std_inputs_builder.OBJ_BOX]
+            classes = samples[std_inputs_builder.OBJ_LABEL]
+            scores = tf.ones_like(classes, dtype=tf.float32) * tf.cast(classes > -1, dtype=tf.float32)
+            image_with_box = visualization_utils.draw_bounding_boxes_on_image_tensors(
+                images_uint8, bboxes, classes, scores, self._category_index, use_normalized_coordinates=False)
+            # visualize predictions
+            images2 = model_utils.copytensor(images_uint8)
+            pre_shape = tf.shape(postprocessed_predictions)
+            bboxes2 = tf.reshape(postprocessed_predictions, [pre_shape[0], -1, pre_shape[-1]])  # bbox:xywh
+            bboxes2_with_score_and_cls = yolo_v3.nms(bboxes2, confidence_threshold=.4, iou_threshold=.5,
+                                                              num_class=self._num_classes)  # bbox: yxyx
+            bboxes2 = bboxes2_with_score_and_cls[..., :4]
+            scores2 = bboxes2_with_score_and_cls[..., 4]
+            classes2 = tf.cast(bboxes2_with_score_and_cls[..., 5], dtype=tf.int64)
+            image_with_box2 = visualization_utils.draw_bounding_boxes_on_image_tensors(
+                images2, bboxes2, classes2, scores2, self._category_index, use_normalized_coordinates=False)
+
+            tf.summary.image('groundtruths', image_with_box,
+                             max_outputs=self._max_num_images_visualized)
+            tf.summary.image('predictions', image_with_box2,
+                             max_outputs=self._max_num_images_visualized)
+
+        train_item = model.TrainItem(
+            loss=loss,
+            ver_list=slim.get_trainable_variables(),  # or =None
+            summary_name='')
+        train_item_list = [train_item]
+        outputs = model.BuildModelOutputs(
+            train_item_list=train_item_list,
+            metric_dict=metric_map)
+
+        return outputs
+
+    def build_optimizer(self, train_number_of_steps):
+        learning_rate = model_utils.get_model_learning_rate(
+            learning_policy=self._config_dict['train_config']['learning_policy'],
+            base_learning_rate=self._config_dict['train_config']['base_learning_rate'],
+            learning_rate_decay_step=self._config_dict['train_config']['learning_rate_decay_step'],
+            learning_rate_decay_factor=self._config_dict['train_config']['learning_rate_decay_factor'],
+            training_number_of_steps=train_number_of_steps,
+            learning_power=self._config_dict['train_config']['learning_power'],
+            slow_start_step=self._config_dict['train_config']['slow_start_step'],
+            slow_start_learning_rate=self._config_dict['train_config']['slow_start_learning_rate'],
+            end_learning_rate=self._config_dict['train_config']['end_learning_rate'])
+        # optimizer = tf.train.AdamOptimizer(learning_rate=0.0001)
+        optimizer = tf.train.MomentumOptimizer(
+            learning_rate=learning_rate,
+            momentum=self._config_dict['train_config']['momentum'])
+        # optimizer = tf.train.RMSPropOptimizer(
+        #     learning_rate=learning_rate,
+        #     decay=self._config_dict['train_config']['rmsprop_decay'],
+        #     momentum=self._config_dict['train_config']['rmsprop_momentum'],
+        #     epsilon=self._config_dict['train_config']['opt_epsilon'])
+
+        optimizer_item = model.OptimizerItem(optimizer=optimizer, learn_rate=learning_rate, summary_name='')
+        optimizer_item_list = [optimizer_item]
+        outputs = model.BuildOptimizerOutputs(optimizer_item_list=optimizer_item_list)
+
+        return outputs
+
+    def schedule_per_train_step(self, train_op_list, step):
+        train_op = train_op_list[0]
+        return train_op
+
+    def get_batch_size(self):
+        return self._batch_size
+
+    def create_for_inferrence(self):
+        inputs = tf.placeholder(tf.uint8, [None, None, None, 3], name=_NAME_INPUT_IMAGE)
+        inputs = tf.image.convert_image_dtype(inputs, dtype=tf.float32)
+        preprocessed_inputs = tf.image.resize_images(
+            inputs, [self._input_size, self._input_size],
+            method=tf.image.ResizeMethod.BILINEAR,
+            align_corners=True)
+        predictions = self.predict(preprocessed_inputs)
+        postprocessed_predictions = self.postprocess(predictions)
+        tf.identity(postprocessed_predictions, name=_NAME_OUTPUT_LOGIT)
+
+    def get_input_names(self):
+        return [_NAME_INPUT_IMAGE]
+
+    def get_output_names(self):
+        return [_NAME_OUTPUT_LOGIT]
+
+    def get_extra_layer_scopes(self):
+        return [_SCOPE_PREDICT_LOGIT]
+
+    def inferrence(self, graph, sess, feeds,
+                   model_info_path=None, sample_info_path=None):
+        images_np = feeds
+        input_images = graph.get_tensor_by_name('%s:0' % _NAME_INPUT_IMAGE)
+        output_logits = graph.get_tensor_by_name('%s:0' % _NAME_OUTPUT_LOGIT)
+        logits_np = sess.run(output_logits, feed_dict={input_images: images_np})
+        logits_np = logits_np.reshape(logits_np.shape[0], -1, logits_np.shape[-1])
+        # print(logits_np.shape)
+        return logits_np
+
+    def every_before_train_step_callback_fn(self, sess):
+        if self._is_debug:
+            _test(sess)
+        else:
+            pass
+
+    def every_after_train_step_callback_fn(self, sess):
+        if self._is_debug:
+            _test(sess)
+        else:
+            pass
